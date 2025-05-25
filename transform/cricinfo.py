@@ -15,41 +15,69 @@ import fnmatch
 from typing import List, Dict, Any, Optional, Tuple
 from google.cloud import storage
 from google.oauth2 import service_account
+
 from dotenv import load_dotenv
 load_dotenv()
 
-# Set up logger first
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler()
-    ]
-)
+
+import os
+MODE = os.getenv('MODE', 'dev')
+
+
+def load_gcp_credentials():
+    try:
+        credentials_b64 = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+        if not credentials_b64:
+            raise ValueError(f"Environment variable not found or empty")
+        
+        credentials_bytes = base64.b64decode(credentials_b64)
+        credentials_dict = json.loads(credentials_bytes)
+        return service_account.Credentials.from_service_account_info(credentials_dict)
+    except Exception as e:
+        logger.error(f"Failed to load credentials from environment: {e}")
+        raise
+    
+# Set up environment-based logging
+if MODE == 'prod':
+    # Production: Use Cloud Logging + structured stdout
+    try:
+        from google.cloud import logging as cloud_logging
+
+        # Load GCP credentials for logging
+        credentials = load_gcp_credentials()
+        cloud_client = cloud_logging.Client(credentials=credentials)
+        cloud_client.setup_logging()
+        print("✅ Google Cloud Logging integration enabled for Cricinfo Transformer")
+
+    except Exception as e:
+        print(f"⚠️ Cloud Logging setup failed, using stdout only: {e}")
+    
+    # Use structured format for production
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        handlers=[logging.StreamHandler()]
+    )
+else:
+    # Development: Use rich console + local file
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('./scrape/aucb_scraper.log', mode="w"),
+            logging.StreamHandler()
+        ]
+    )
 logger = logging.getLogger(__name__)
 
 # Set up environment-based paths
-MODE = os.getenv('MODE', 'dev')
 
 if MODE == 'prod':
     # GCP Storage paths
     OUTPUT_BASE_DIR = 'cricket-data-1'
-    JSON_DATA_DIR = f'{OUTPUT_BASE_DIR}/json_data'
+    JSON_DATA_DIR = 'json_data'
     BBB_DATA_DIR = f'{OUTPUT_BASE_DIR}'
     
-    # Load GCP credentials
-    def load_gcp_credentials():
-        try:
-            credentials_b64 = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-            if not credentials_b64:
-                raise ValueError(f"Environment variable not found or empty")
-            
-            credentials_bytes = base64.b64decode(credentials_b64)
-            credentials_dict = json.loads(credentials_bytes)
-            return service_account.Credentials.from_service_account_info(credentials_dict)
-        except Exception as e:
-            logger.error(f"Failed to load credentials from environment: {e}")
-            raise
 
     # Initialize GCP client
     try:
@@ -80,18 +108,28 @@ def read_file(file_path: str) -> dict:
             return orjson.loads(f.read())
 
 def write_file(file_path: str, data: dict) -> None:
-    """Write data to either local storage or GCP bucket"""
+    """Write data to either local storage or GCP bucket in NDJSON format"""
     if MODE == 'prod':
         try:
             blob = bucket.blob(file_path)
-            blob.upload_from_string(orjson.dumps(data))
+            # Convert list of records to NDJSON format
+            if isinstance(data, list):
+                ndjson_content = '\n'.join(orjson.dumps(record).decode('utf-8') for record in data)
+            else:
+                ndjson_content = orjson.dumps(data).decode('utf-8')
+            blob.upload_from_string(ndjson_content)
         except Exception as e:
             logger.error(f"Error writing to GCP: {file_path} - {e}")
             raise
     else:
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        with open(file_path, 'wb') as f:
-            f.write(orjson.dumps(data))
+        with open(file_path, 'w', encoding='utf-8') as f:
+            # Convert list of records to NDJSON format
+            if isinstance(data, list):
+                for record in data:
+                    f.write(orjson.dumps(record).decode('utf-8') + '\n')
+            else:
+                f.write(orjson.dumps(data).decode('utf-8') + '\n')
 
 def file_exists(file_path: str) -> bool:
     """Check if file exists in either local storage or GCP bucket"""
@@ -635,13 +673,18 @@ def process_single_file(transformer, output_dir, file_path):
     and saves the output to the specified directory.
     Returns a tuple (bool: success, str: file_path, str: error_message | None).
     """
-    # Get the original base filename
+    # Get the original base filename and change extension to .ndjson
     base_filename = os.path.basename(file_path)
+    base_filename = base_filename.replace('.json', '.ndjson')
     # Construct the full output path
-    output_path = f"{BBB_DATA_DIR}/cricinfo/{base_filename}"
+    if MODE == 'prod':
+        output_path = f"cricinfo/{base_filename}"
+    else:
+        output_path = f"{BBB_DATA_DIR}/cricinfo/{base_filename}"
     
     # Skip processing if output file already exists
     if file_exists(output_path):
+        logger.info(f"Skipped - file already processed: {output_path}")
         return True, file_path, "Skipped - file already processed"
         
     try:
@@ -664,12 +707,10 @@ def process_single_file(transformer, output_dir, file_path):
         return False, file_path, error_msg
 
 # --- Main Execution Logic ---
-if __name__ == "__main__":
+def main():
+    """Main function that returns True on success, False on failure"""
     # Add file handler for detailed logging
-    log_file = './transform/transform_cricinfo.log'
-    file_handler = logging.FileHandler(log_file, mode="a")
-    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-    logger.addHandler(file_handler)
+
     
     input_dir = f'{JSON_DATA_DIR}/cricinfo_matches/commentary'
     output_dir = f'{BBB_DATA_DIR}/cricinfo'
@@ -680,12 +721,13 @@ if __name__ == "__main__":
 
     # Find all JSON files in the input directory
     json_files = list_files(input_dir, "*.json")
+
     total_files = len(json_files)
     logger.info(f"Found {total_files} JSON files to process in {input_dir}.")
 
     if not json_files:
         logger.info("No JSON files found to process. Exiting.")
-        exit()
+        return False
 
     transformer = CricinfoTransformer() # Instantiate transformer once
 
@@ -739,4 +781,9 @@ if __name__ == "__main__":
          logger.info(f"Average time per successfully processed file: {total_time/files_succeeded_count:.3f} seconds.")
     logger.info(f"Successful: {files_succeeded_count}, Failed: {files_failed_count}")
 
-    logger.info(f"Logs saved to {log_file}")
+    
+    # Return True if any files were processed successfully
+    return files_succeeded_count > 0
+
+if __name__ == "__main__":
+    main()

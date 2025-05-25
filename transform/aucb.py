@@ -14,39 +14,66 @@ import json
 from google.cloud import storage
 from google.oauth2 import service_account
 import fnmatch
+import os
+from dotenv import load_dotenv
+load_dotenv()
+MODE = os.getenv('MODE', 'dev')
 
-# Set up logger first
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler()
-    ]
-)
+
+def load_gcp_credentials():
+    try:
+        credentials_b64 = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+        if not credentials_b64:
+            raise ValueError(f"Environment variable not found or empty")
+        
+        credentials_bytes = base64.b64decode(credentials_b64)
+        credentials_dict = json.loads(credentials_bytes)
+        return service_account.Credentials.from_service_account_info(credentials_dict)
+    except Exception as e:
+        logger.error(f"Failed to load credentials from environment: {e}")
+        raise
+    
+# Set up environment-based logging
+if MODE == 'prod':
+    # Production: Use Cloud Logging + structured stdout
+    try:
+        from google.cloud import logging as cloud_logging
+
+        # Load GCP credentials for logging
+        credentials = load_gcp_credentials()
+        cloud_client = cloud_logging.Client(credentials=credentials)
+        cloud_client.setup_logging()
+        print("✅ Google Cloud Logging integration enabled for AUCB Transformer")
+
+    except Exception as e:
+        print(f"⚠️ Cloud Logging setup failed, using stdout only: {e}")
+    
+    # Use structured format for production
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        handlers=[logging.StreamHandler()]
+    )
+else:
+    # Development: Use rich console + local file
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('./scrape/aucb_scraper.log', mode="w"),
+            logging.StreamHandler()
+        ]
+    )
 logger = logging.getLogger(__name__)
 
 # Set up environment-based paths
-MODE = os.getenv('MODE', 'dev')
 
 if MODE == 'prod':
     # GCP Storage paths
     OUTPUT_BASE_DIR = 'cricket-data-1'
-    JSON_DATA_DIR = f'{OUTPUT_BASE_DIR}/json_data'
-    BBB_DATA_DIR = f'{OUTPUT_BASE_DIR}/bbb_data'
+    JSON_DATA_DIR = 'json_data'
     
-    # Load GCP credentials
-    def load_gcp_credentials():
-        try:
-            credentials_b64 = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-            if not credentials_b64:
-                raise ValueError(f"Environment variable not found or empty")
-            
-            credentials_bytes = base64.b64decode(credentials_b64)
-            credentials_dict = json.loads(credentials_bytes)
-            return service_account.Credentials.from_service_account_info(credentials_dict)
-        except Exception as e:
-            logger.error(f"Failed to load credentials from environment: {e}")
-            raise
+
 
     # Initialize GCP client
     try:
@@ -77,17 +104,28 @@ def read_file(file_path):
             return orjson.loads(f.read())
 
 def write_file(file_path, data):
-    """Write data to either local storage or GCP bucket"""
+    """Write data to either local storage or GCP bucket in NDJSON format"""
     if MODE == 'prod':
         try:
             blob = bucket.blob(file_path)
-            blob.upload_from_string(orjson.dumps(data))
+            # Convert list of records to NDJSON format
+            if isinstance(data, list):
+                ndjson_content = '\n'.join(orjson.dumps(record).decode('utf-8') for record in data)
+            else:
+                ndjson_content = orjson.dumps(data).decode('utf-8')
+            blob.upload_from_string(ndjson_content)
         except Exception as e:
             logger.error(f"Error writing to GCP: {file_path} - {e}")
             raise
     else:
-        with open(file_path, 'wb') as f:
-            f.write(orjson.dumps(data))
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        with open(file_path, 'w', encoding='utf-8') as f:
+            # Convert list of records to NDJSON format
+            if isinstance(data, list):
+                for record in data:
+                    f.write(orjson.dumps(record).decode('utf-8') + '\n')
+            else:
+                f.write(orjson.dumps(data).decode('utf-8') + '\n')
 
 def ensure_dir(dir_path):
     """Ensure directory exists (only needed for local storage)"""
@@ -104,6 +142,7 @@ def list_files(directory, pattern="*"):
             logger.error(f"Error listing files from GCP: {directory} - {e}")
             raise
     else:
+        # print(glob.glob(os.path.join(directory, pattern)))
         return glob.glob(os.path.join(directory, pattern))
 
 def file_exists(file_path):
@@ -208,7 +247,10 @@ def process_match(match_id):
     scorecard_path = f"{base_path}/scorecard.json"
     
     # Check if output file already exists
-    output_path = f"{BBB_DATA_DIR}/aucb/{match_id}_commentary.json"
+    if MODE == 'prod':
+        output_path = f"aucb/{match_id}_commentary.ndjson"
+    else:
+        output_path = f"{BBB_DATA_DIR}/aucb/{match_id}_commentary.ndjson"
     
     if file_exists(output_path):
         return True, match_id, "Skipped - file already processed"
@@ -309,13 +351,7 @@ def process_match(match_id):
 
 def main():
     """Process all match directories using multiprocessing."""
-    logger = logging.getLogger(__name__)
-    
-    # Add file handler for detailed logging
-    log_file = './transform/transform_aucb.log'
-    file_handler = logging.FileHandler(log_file, mode="a")
-    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-    logger.addHandler(file_handler)
+
     
     # Use the existing list_files utility to find fixture files
     fixture_files = list_files(f"{JSON_DATA_DIR}/aucb_matches", "*/fixture.json")
@@ -323,10 +359,12 @@ def main():
     # Extract match IDs from the fixture file paths
     match_ids = []
     for file_path in fixture_files:
-        # Path format: json_data/aucb_matches/{match_id}/fixture.json
-        parts = file_path.split('/')
-        if len(parts) >= 3:
-            match_id = parts[-2]  # Get the match_id part
+        # Normalize path separators for cross-platform compatibility
+        
+        normalized_path = file_path.replace('\\', '/')  # Convert backslashes to forward slashes
+        parts = normalized_path.split('/')
+        if len(parts) >= 3 and parts[-1] == 'fixture.json':
+            match_id = parts[-2]
             match_ids.append(match_id)
     
     total_matches = len(match_ids)
@@ -334,7 +372,7 @@ def main():
     
     if not match_ids:
         logger.warning("No match directories found")
-        return
+        return False
     
     # Determine number of worker processes
     num_workers = max(1, multiprocessing.cpu_count() - 1 if multiprocessing.cpu_count() else 1)
@@ -386,6 +424,9 @@ def main():
     if matches_succeeded_count > 0:
         logger.info(f"Average time per successfully processed match: {total_time/matches_succeeded_count:.3f} seconds.")
     logger.info(f"Successful: {matches_succeeded_count}, Skipped: {matches_skipped_count}, Failed: {matches_failed_count}")
+    
+    # Return True if any matches were processed successfully, False if all failed
+    return matches_succeeded_count > 0 or matches_skipped_count > 0
 
 if __name__ == "__main__":
     main()

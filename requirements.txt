@@ -16,3 +16,4 @@ pandas
 pyarrow
 gcloud-aio-storage
 aiofiles
+google-cloud-logging

@@ -11,42 +11,71 @@ import datetime
 import base64
 from google.cloud import storage
 from google.oauth2 import service_account
-# import nest_asyncio
-# nest_asyncio.apply()
-# Set up logging first
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('./scrape/aucb_scraper.log', mode="a"),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+
 from dotenv import load_dotenv
 load_dotenv()
+
 # Set up environment-based paths
 MODE = os.getenv('MODE', 'dev')
-PROXY=os.getenv('PROXY')
-PREV_DATE=os.getenv('PREV_DATE', '2025-05-01')
+
+
+def load_gcp_credentials():
+    try:
+        credentials_b64 = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+        if not credentials_b64:
+            raise ValueError(f"Environment variable not found or empty")
+        
+        credentials_bytes = base64.b64decode(credentials_b64)
+        credentials_dict = json.loads(credentials_bytes)
+        return service_account.Credentials.from_service_account_info(credentials_dict)
+    except Exception as e:
+        logger.error(f"Failed to load credentials from environment: {e}")
+        raise
+    
+# Set up environment-based logging
+if MODE == 'prod':
+    # Production: Use Cloud Logging + structured stdout
+    try:
+        from google.cloud import logging as cloud_logging
+
+        # Load GCP credentials for logging
+        credentials = load_gcp_credentials()
+        cloud_client = cloud_logging.Client(credentials=credentials)
+        cloud_client.setup_logging()
+        print("✅ Google Cloud Logging integration enabled for AUCB scraper")
+
+    except Exception as e:
+        print(f"⚠️ Cloud Logging setup failed, using stdout only: {e}")
+    
+    # Use structured format for production
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        handlers=[logging.StreamHandler()]
+    )
+else:
+    # Development: Use rich console + local file
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('./scrape/aucb_scraper.log', mode="w"),
+            logging.StreamHandler()
+        ]
+    )
+logger = logging.getLogger(__name__)
+
+
+PROXY = os.getenv('PROXY')
+PREV_DATE = os.getenv('PREV_DATE', '2025-05-01')
+
 if MODE == 'prod':
     # GCP Storage paths
     OUTPUT_BASE_DIR = 'cricket-data-1'
-    JSON_DATA_DIR = f'{OUTPUT_BASE_DIR}/json_data'
+    JSON_DATA_DIR = 'json_data'
     
     # Load GCP credentials
-    def load_gcp_credentials():
-        try:
-            credentials_b64 = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-            if not credentials_b64:
-                raise ValueError(f"Environment variable not found or empty")
-            
-            credentials_bytes = base64.b64decode(credentials_b64)
-            credentials_dict = json.loads(credentials_bytes)
-            return service_account.Credentials.from_service_account_info(credentials_dict)
-        except Exception as e:
-            logger.error(f"Failed to load credentials from environment: {e}")
-            raise
+
 
     # Initialize GCP client
     try:
@@ -100,7 +129,7 @@ OUTPUT_DIR = Path("json_data/aucb_matches")
 CONCURRENCY_LIMIT = 300  # Adjust based on your needs
 FIXTURES_CONCURRENCY_LIMIT = 5
 FIXTURES_DELAY_SECONDS = 3
-YEARS = range(2025 , 2026)  # 2019 to 2025 inclusive
+YEARS = range(2025, 2026)  # 2019 to 2025 inclusive
 VALID_GAME_TYPE_IDS = {1, 2, 3, 6, 24}
 
 # Webshare proxy configuration
@@ -129,12 +158,12 @@ class FixtureScraper:
                 response.raise_for_status()  # Raise an exception for bad status codes
                 data = response.json()
                 logger.info(f"Successfully fetched fixtures for year: {year}")
-                await asyncio.sleep(FIXTURES_DELAY_SECONDS) # Wait after successful fetch before releasing semaphore
+                await asyncio.sleep(FIXTURES_DELAY_SECONDS)  # Wait after successful fetch before releasing semaphore
                 return data.get("fixtures", [])
             except Exception as e:
                 logger.error(f"Error fetching fixtures for year {year}: {e}")
-                await asyncio.sleep(FIXTURES_DELAY_SECONDS) # Also wait on error before releasing
-                return [] # Return empty list on error
+                await asyncio.sleep(FIXTURES_DELAY_SECONDS)  # Also wait on error before releasing
+                return []  # Return empty list on error
 
     @staticmethod
     async def save_fixture(fixture: dict):
@@ -229,7 +258,7 @@ class CricketScraper:
             if not base_dir.exists():
                 logger.warning(f"Output directory {base_dir} does not exist.")
                 return fixture_ids
-                
+            
             for match_dir in base_dir.iterdir():
                 if not match_dir.is_dir():
                     continue
@@ -251,7 +280,7 @@ class CricketScraper:
         """Generate URLs for both scorecard and comments based on fixture IDs"""
         urls = []
         
-        for fixture_id in self.fixture_ids:
+        for fixture_id in sorted(self.fixture_ids, reverse=True):
             base_path = f"{JSON_DATA_DIR}/aucb_matches/{fixture_id}"
             
             # Scorecard URL - check if file exists
@@ -272,7 +301,10 @@ class CricketScraper:
                         "fixture_id": fixture_id,
                         "type": f"inning{inning_num}"
                     })
-        
+            if len(urls) > 1000:
+                break
+
+                    
         logger.info(f"Generated {len(urls)} URLs to scrape for {len(self.fixture_ids)} fixtures")
         return urls
 
@@ -288,18 +320,12 @@ class CricketScraper:
             proxy_url = proxies['http']
             
             try:
-                # Random timeout between 10-30 seconds
-                
                 response = await session.get(
                     url,
                     headers=headers,
-                    impersonate=random.choice(["chrome110", "chrome116", "chrome119", "chrome120", "chrome123", "chrome123", "chrome123", "chrome124", "chrome124", "chrome124", "chrome131", "chrome131", "chrome131", "chrome131"]),
+                    impersonate=random.choice(["chrome110", "chrome116", "chrome119", "chrome120", "chrome123", "chrome124", "chrome131"]),
                     proxies=proxies
                 )
-
-                # Add a small random delay after each request
-                delay = random.uniform(2, 2.5)
-                # await asyncio.sleep(delay)
 
                 if response.status_code != 200:
                     logger.warning(f"Failed to fetch {url} via proxy {proxy_url}, status: {response.status_code} - {response.reason}")
@@ -345,7 +371,7 @@ class CricketScraper:
                 
             # 3. Check game type ID
             game_type_id = data.get("fixture", {}).get("gameTypeId")
-            if game_type_id not in [1,2, 3, 6,24]:
+            if game_type_id not in [1, 2, 3, 6, 24]:
                 return False
                 
             # 4. Check if no result
@@ -421,22 +447,28 @@ class CricketScraper:
                 
                 # Add a fixed delay between batches
                 logger.info("Pausing for 5 seconds between batches")
-                # await asyncio.sleep(5)
                 
         logger.info("BBB data scraping completed!")
 
 async def main():
-    # First, scrape fixtures
-    # logger.info("Starting cricket data pipeline: fixtures scraping")
-    # fixture_ids = await FixtureScraper.scrape_fixtures()
-    
-    # Then scrape match data
-    logger.info("Starting cricket data pipeline: BBB data scraping")
-    scraper = CricketScraper()
-    await scraper.scrape()
-    
-    logger.info("Complete cricket data pipeline finished successfully")
+    """Main function that returns True on success, False on failure"""
+    try:
+        # First, scrape fixtures
+        logger.info("Starting cricket data pipeline: fixtures scraping")
+        fixture_ids = await FixtureScraper.scrape_fixtures()
+        
+        # Then scrape match data
+        logger.info("Starting cricket data pipeline: BBB data scraping")
+        scraper = CricketScraper()
+        await scraper.scrape()
+        
+        logger.info("Complete cricket data pipeline finished successfully")
+        return True  # Success
+        
+    except Exception as e:
+        logger.error(f"Cricket data pipeline failed: {e}")
+        return False  # Failure
 
 if __name__ == "__main__":
     logger.info("Starting cricket data scraper")
-    asyncio.run(main())
+    asyncio.run(main()) 

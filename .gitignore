@@ -6,6 +6,9 @@ venv/
 json_data/
 
 # Specific files in scrape/ directory (excluding aucb_bbb_scrape.py)
+deploy.sh
+.cursorignore
+
 scrape/cricinfo_bbb_scrape.py
 scrape/cricinfo_scrape.ipynb
 scrape/check_failed_matches.py
